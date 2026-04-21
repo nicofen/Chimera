@@ -1,4 +1,4 @@
-## Project Chimera
+# Project Chimera
 Institutional-grade, multi-asset trading mainframe built on an async
 Producer-Consumer microservices architecture.
 Architecture
