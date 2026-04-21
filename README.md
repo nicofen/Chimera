@@ -47,13 +47,13 @@ base_risk_pct from config (default 1%)
 Kelly Criterion (computed from rolling 50-trade win history)
 News Agent confidence multiplier (0 during veto)
 
-The Veto System
+The Veto System:
 The News Agent raises veto_active = True when any of the following are
 detected in FinancialJuice or Stocktwits headlines:
 
-FOMC / Fed meeting / rate decision
-CPI / PCE / NFP releases
-Emergency central bank actions
+### FOMC / Fed meeting / rate decision
+### CPI / PCE / NFP releases
+### Emergency central bank actions
 
 All pending signals are dropped and the system stays in cash for a
 configurable cool-down window (default: 10 minutes).
