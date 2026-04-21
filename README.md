@@ -1,12 +1,14 @@
-"""
+
+News Agent:
 chimera/agents/news_agent.py
 News Agent — polls FinancialJuice and Stocktwits, runs LLM-based NLP
 classification, sets confidence intervals, and raises macro veto flags.
 
+FOR SAFTEY:
 The veto system is the most important safety mechanism in Chimera:
 if a high-impact Fed / CPI / NFP event is detected, ALL technical signals
 are suppressed until the dust settles (configurable cool-down window).
-"""
+
 
 import asyncio
 import re
