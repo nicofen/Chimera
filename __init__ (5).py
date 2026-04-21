@@ -1,0 +1,128 @@
+"""
+chimera/utils/state.py
+Shared State Dictionary — the single source of truth for all agents.
+
+All agents read from and write to this object exclusively.
+The News Agent sets `veto_active = True` when a high-impact event is pending,
+which causes StrategyAgent to suppress signal emission automatically.
+"""
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+
+class Sentiment(str, Enum):
+    BULLISH  = "bullish"
+    BEARISH  = "bearish"
+    NEUTRAL  = "neutral"
+
+
+class MarketRegime(str, Enum):
+    RISK_ON      = "risk_on"
+    RISK_OFF     = "risk_off"
+    HIGH_VOL     = "high_volatility"
+    MEAN_REVERT  = "mean_reversion"
+    NEUTRAL      = "neutral"
+
+
+@dataclass
+class NewsState:
+    sentiment: Sentiment = Sentiment.NEUTRAL
+    confidence: float = 0.0          # 0–1 CI from NLP agent
+    veto_active: bool = False         # True during high-impact Fed / macro events
+    veto_reason: str = ""
+    last_updated: datetime | None = None
+
+
+@dataclass
+class MarketData:
+    """Latest bars, order-book snapshots, and on-chain data per sector."""
+    crypto:  dict[str, Any] = field(default_factory=dict)
+    stocks:  dict[str, Any] = field(default_factory=dict)
+    forex:   dict[str, Any] = field(default_factory=dict)
+    futures: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TechnicalSignals:
+    """Output of the TA engine — populated by StrategyAgent."""
+    sector: str = ""
+    symbol: str = ""
+    direction: str = ""              # "long" | "short" | "flat"
+    confidence: float = 0.0
+    sp_score: float = 0.0            # Squeeze Probability Score (stocks)
+    adx: float = 0.0
+    rsi_divergence: bool = False
+    bb_squeeze: bool = False
+    ema_ribbon_aligned: bool = False
+    atr: float = 0.0
+    timestamp: datetime | None = None
+
+
+@dataclass
+class RiskParameters:
+    """Computed by RiskAgent, consumed by the OMS."""
+    symbol: str = ""
+    position_size: float = 0.0       # units / contracts
+    entry_price: float = 0.0
+    stop_price: float = 0.0          # ATR × 2 trailing stop
+    take_profit: float = 0.0
+    kelly_fraction: float = 0.0
+    max_loss_usd: float = 0.0
+
+
+class SharedState:
+    """
+    Thread-safe shared state container.
+
+    Agents write to their dedicated sections; the orchestrator never needs to
+    mediate — asyncio's single-threaded event loop ensures writes are atomic
+    at the coroutine level. If you move to multi-process, swap the plain
+    asyncio.Lock for a multiprocessing.Manager proxy.
+    """
+
+    def __init__(self):
+        self.news          = NewsState()
+        self.market        = MarketData()
+        self.signals: list[TechnicalSignals] = []
+        self.risk_params: list[RiskParameters] = []
+        self.regime        = MarketRegime.NEUTRAL
+        self.equity        = 0.0
+        self.open_positions: dict[str, Any] = {}
+
+        # Queues for loose coupling between layers
+        self.signal_queue:  asyncio.Queue = asyncio.Queue()
+        self.order_queue:   asyncio.Queue = asyncio.Queue()
+        self._lock                         = asyncio.Lock()
+
+    async def put_signal(self, signal: TechnicalSignals) -> None:
+        async with self._lock:
+            self.signals.append(signal)
+        await self.signal_queue.put(signal)
+
+    async def put_order(self, risk_params: RiskParameters) -> None:
+        async with self._lock:
+            self.risk_params.append(risk_params)
+        await self.order_queue.put(risk_params)
+
+    def is_vetoed(self) -> bool:
+        """Returns True if the News Agent has raised a veto."""
+        return self.news.veto_active
+
+    def news_multiplier(self) -> float:
+        """
+        Returns a confidence multiplier (0–1) from the NLP sentiment engine.
+        Bearish sentiment reduces position size; bullish amplifies it slightly.
+        Veto returns 0.0 — no trade.
+        """
+        if self.news.veto_active:
+            return 0.0
+        base = self.news.confidence
+        if self.news.sentiment == Sentiment.BULLISH:
+            return min(1.0, base * 1.1)
+        if self.news.sentiment == Sentiment.BEARISH:
+            return base * 0.5
+        return base
