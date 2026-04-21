@@ -28,7 +28,7 @@ EOF
 
 ## 4. Run the mainframe
 python -m chimera.mainframe
-The Four Pillars
+### The Four Pillars
 SectorEdgeKey Data SourcesCryptoExchange inflow/outflowWhale Alert, Dune, Alpaca WSStocksShort Squeeze (Sp score)Finviz, Stocktwits, AlpacaForexNLP momentum on EMAFinancialJuice, AlpacaFuturesValue Area mean reversionAlpaca CME, AVWAP
 Squeeze Probability Score
 Sp = (SI × 0.4) + (V_velocity × 0.3) + (S_sentiment × 0.3)
