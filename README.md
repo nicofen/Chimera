@@ -13,10 +13,10 @@ Quick Start
 bash# 1. Create a virtual environment
 python -m venv .venv && source .venv/bin/activate
 
-# 2. Install dependencies
+## 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Create your .env file (never commit this)
+## 3. Create your .env file (never commit this)
 cat > .env << EOF
 ALPACA_KEY=your_alpaca_key
 ALPACA_SECRET=your_alpaca_secret
@@ -26,7 +26,7 @@ DUNE_API_KEY=your_dune_key             # optional
 CHIMERA_MODE=paper                     # ALWAYS start with paper
 EOF
 
-# 4. Run the mainframe
+## 4. Run the mainframe
 python -m chimera.mainframe
 The Four Pillars
 SectorEdgeKey Data SourcesCryptoExchange inflow/outflowWhale Alert, Dune, Alpaca WSStocksShort Squeeze (Sp score)Finviz, Stocktwits, AlpacaForexNLP momentum on EMAFinancialJuice, AlpacaFuturesValue Area mean reversionAlpaca CME, AVWAP
@@ -57,12 +57,13 @@ Emergency central bank actions
 
 All pending signals are dropped and the system stays in cash for a
 configurable cool-down window (default: 10 minutes).
-News Agent:
+
+## News Agent:
 chimera/agents/news_agent.py
 News Agent — polls FinancialJuice and Stocktwits, runs LLM-based NLP
 classification, sets confidence intervals, and raises macro veto flags.
 
-FOR SAFTEY:
+## FOR SAFTEY:
 The veto system is the most important safety mechanism in Chimera:
 if a high-impact Fed / CPI / NFP event is detected, ALL technical signals
 are suppressed until the dust settles (configurable cool-down window).
@@ -83,7 +84,7 @@ from chimera.utils.logger import setup_logger
 
 log = setup_logger("news_agent")
 
-# ── Veto keywords ──────────────────────────────────────────────────────────────
+## Veto keywords
 VETO_PATTERNS = [
     r"fed\s+(decision|meeting|statement|chair|powell)",
     r"fomc",
