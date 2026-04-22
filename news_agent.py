@@ -1,229 +1,164 @@
 """
-chimera/agents/data_agent.py
-Data Agent — manages all market data ingestion.
+chimera/agents/risk_agent.py
+Risk Agent — consumes TechnicalSignals from the queue, computes optimal
+position size (Kelly Criterion), sets ATR-based stops, and dispatches
+RiskParameters to the Order Queue for the OMS.
 
-WebSocket streams: Alpaca (stocks, forex, futures), crypto exchange WS.
-REST polling:      Whale Alert, CoinMarketCap, Dune Analytics, Finviz, Stocktwits.
+The position sizing formula:
+    Position Size = (Account Equity × Risk%) / (ATR × ATR_Multiplier)
 
-Writes normalized OHLCV + metadata bars into state.market.{sector}.
+Kelly fraction is computed from the agent's rolling win/loss history and
+used as a ceiling on position size — never bet more than Kelly suggests.
 """
 
 import asyncio
-import json
-import time
+from collections import deque
+from datetime import datetime
 from typing import Any
 
-import aiohttp
-import websockets
-
-from chimera.utils.state import SharedState
+from chimera.utils.state import SharedState, TechnicalSignals, RiskParameters
 from chimera.utils.logger import setup_logger
 
-log = setup_logger("data_agent")
-
-ALPACA_WS_URL    = "wss://stream.data.alpaca.markets/v2/iex"
-ALPACA_CRYPTO_WS = "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
+log = setup_logger("risk_agent")
 
 
-class DataAgent:
+# ── Hard limits — override these in config, never remove them ─────────────────
+MAX_RISK_PER_TRADE  = 0.02    # 2% of equity maximum
+MAX_KELLY_FRACTION  = 0.25    # never bet more than 25% Kelly even if math allows
+ATR_MULTIPLIER      = 2.0     # stop = entry ± ATR × 2
+TP_MULTIPLIER       = 3.0     # take-profit = entry ± ATR × 3  (1:1.5 R:R minimum)
+MIN_CONFIDENCE      = 0.50    # discard signals below this confidence threshold
+
+
+class RiskAgent:
     """
-    Runs all ingestor coroutines concurrently.
-    Each ingestor writes directly into the shared state's market dicts.
+    Sits between StrategyAgent and the OMS.
+
+    Flow:
+        TechnicalSignals queue → Kelly sizing → ATR stop/TP → RiskParameters queue
     """
 
     def __init__(self, state: SharedState, config: dict[str, Any]):
         self.state  = state
         self.config = config
 
-    async def run(self) -> None:
-        log.info("DataAgent started.")
-        await asyncio.gather(
-            self._alpaca_stocks_ws(),
-            self._alpaca_crypto_ws(),
-            self._whale_alert_poll(),
-            self._finviz_poll(),
-            self._dune_poll(),
-            self._alpaca_futures_poll(),
+        # Rolling performance window for Kelly Criterion
+        self._win_history: deque[bool] = deque(
+            maxlen=config.get("kelly_lookback", 50)
         )
 
-    # ── Alpaca Stocks WebSocket ───────────────────────────────────────────────
-
-    async def _alpaca_stocks_ws(self) -> None:
-        symbols = self.config.get("stock_symbols", ["AAPL", "TSLA", "GME"])
-        headers = {
-            "APCA-API-KEY-ID":     self.config["alpaca_key"],
-            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
-        }
+    async def run(self) -> None:
+        log.info("RiskAgent started — waiting for signals.")
         while True:
             try:
-                async with websockets.connect(ALPACA_WS_URL, extra_headers=headers) as ws:
-                    await ws.send(json.dumps({
-                        "action": "subscribe",
-                        "bars":   symbols,
-                        "trades": symbols,
-                    }))
-                    async for raw in ws:
-                        msgs = json.loads(raw)
-                        for msg in msgs:
-                            if msg.get("T") == "b":   # bar message
-                                sym = msg["S"]
-                                bars = self.state.market.stocks.setdefault(sym, {
-                                    "close": [], "high": [], "low": [], "volume": []
-                                })
-                                bars["close"].append(float(msg["c"]))
-                                bars["high"].append(float(msg["h"]))
-                                bars["low"].append(float(msg["l"]))
-                                bars["volume"].append(float(msg["v"]))
-                                # Keep a rolling 500-bar window
-                                for k in bars:
-                                    bars[k] = bars[k][-500:]
+                signal: TechnicalSignals = await asyncio.wait_for(
+                    self.state.signal_queue.get(), timeout=5.0
+                )
+                await self._process(signal)
+            except asyncio.TimeoutError:
+                pass   # no signal — loop back
             except Exception as e:
-                log.warning(f"Stocks WS error: {e} — reconnecting in 5s")
-                await asyncio.sleep(5)
+                log.warning(f"RiskAgent error: {e}")
 
-    # ── Alpaca Crypto WebSocket ───────────────────────────────────────────────
-
-    async def _alpaca_crypto_ws(self) -> None:
-        symbols = self.config.get("crypto_symbols", ["BTC/USD", "ETH/USD", "SOL/USD"])
-        headers = {
-            "APCA-API-KEY-ID":     self.config["alpaca_key"],
-            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
-        }
-        while True:
-            try:
-                async with websockets.connect(ALPACA_CRYPTO_WS, extra_headers=headers) as ws:
-                    await ws.send(json.dumps({"action": "subscribe", "bars": symbols}))
-                    async for raw in ws:
-                        msgs = json.loads(raw)
-                        for msg in msgs:
-                            if msg.get("T") == "b":
-                                sym = msg["S"]
-                                bars = self.state.market.crypto.setdefault(sym, {
-                                    "close": [], "high": [], "low": [], "volume": []
-                                })
-                                bars["close"].append(float(msg["c"]))
-                                bars["high"].append(float(msg["h"]))
-                                bars["low"].append(float(msg["l"]))
-                                bars["volume"].append(float(msg["v"]))
-                                for k in bars:
-                                    bars[k] = bars[k][-500:]
-            except Exception as e:
-                log.warning(f"Crypto WS error: {e} — reconnecting in 5s")
-                await asyncio.sleep(5)
-
-    # ── Whale Alert REST poll ─────────────────────────────────────────────────
-
-    async def _whale_alert_poll(self) -> None:
-        url      = "https://api.whale-alert.io/v1/transactions"
-        api_key  = self.config.get("whale_alert_key", "")
-        interval = self.config.get("whale_poll_seconds", 60)
-
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    params = {
-                        "api_key":   api_key,
-                        "cursor":    int(time.time()) - interval,
-                        "min_value": 1_000_000,
-                        "limit":     100,
-                    }
-                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        data = await resp.json()
-                        inflow = sum(
-                            tx["amount_usd"]
-                            for tx in data.get("transactions", [])
-                            if tx.get("to", {}).get("owner_type") == "exchange"
-                            and tx.get("symbol", "").upper() == "BTC"
-                        )
-                        self.state.market.crypto["btc_exchange_inflow"] = inflow
-                        log.debug(f"BTC exchange inflow (last {interval}s): ${inflow:,.0f}")
-                except Exception as e:
-                    log.warning(f"Whale Alert poll error: {e}")
-                await asyncio.sleep(interval)
-
-    # ── Finviz screener poll (short interest + RVOL) ─────────────────────────
-
-    async def _finviz_poll(self) -> None:
-        """
-        Uses finviz Python library (pip install finviz) to screen for
-        high short-interest, high RVOL candidates every 5 minutes.
-        """
-        try:
-            import finviz
-        except ImportError:
-            log.warning("finviz not installed — skipping stock screener.")
+    async def _process(self, signal: TechnicalSignals) -> None:
+        # Re-check veto (signal could have been queued just before veto raised)
+        if self.state.is_vetoed():
+            log.info(f"Dropping signal {signal.symbol} — veto active.")
             return
 
-        interval = self.config.get("finviz_poll_seconds", 300)
-        filters  = ["sh_short_o20", "ta_relvol_o3"]   # SI > 20%, RVOL > 3
+        if signal.confidence < MIN_CONFIDENCE:
+            log.debug(f"Dropping {signal.symbol} — confidence {signal.confidence:.2f} below threshold.")
+            return
 
-        while True:
-            try:
-                results = finviz.get_screener(filters=filters, table="Performance")
-                for row in results[:20]:
-                    sym = row.get("Ticker", "")
-                    if sym in self.state.market.stocks:
-                        self.state.market.stocks[sym]["short_interest"] = (
-                            float(str(row.get("Short Float", "0")).strip("%")) / 100
-                        )
-                        self.state.market.stocks[sym]["rvol"] = float(row.get("Rel Volume", 1.0))
-            except Exception as e:
-                log.warning(f"Finviz poll error: {e}")
-            await asyncio.sleep(interval)
+        equity      = self.state.equity
+        if equity <= 0:
+            log.warning("Equity not set in state — skipping.")
+            return
 
-    # ── Dune Analytics poll (Solana memecoin volume) ─────────────────────────
+        kelly       = self._kelly_fraction()
+        risk_pct    = min(
+            self.config.get("base_risk_pct", 0.01),
+            MAX_RISK_PER_TRADE,
+            kelly,
+        )
+        risk_pct   *= self.state.news_multiplier()   # News Agent multiplier applied here
 
-    async def _dune_poll(self) -> None:
-        dune_key = self.config.get("dune_api_key", "")
-        query_id = self.config.get("dune_memecoin_query_id", "3152691")  # memecoin wars
-        interval = self.config.get("dune_poll_seconds", 300)
-        url      = f"https://api.dune.com/api/v1/query/{query_id}/results"
+        # Apply signal confidence as a further scalar
+        risk_pct   *= signal.confidence
 
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    headers = {"X-Dune-API-Key": dune_key}
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        data  = await resp.json()
-                        rows  = data.get("result", {}).get("rows", [])
-                        vol   = sum(r.get("volume_usd", 0) for r in rows[:10])
-                        spike = vol > self.config.get("sol_memecoin_spike_threshold", 50_000_000)
-                        self.state.market.crypto["sol_memecoin_vol_spike"] = spike
-                        log.debug(f"Sol memecoin vol: ${vol:,.0f} spike={spike}")
-                except Exception as e:
-                    log.warning(f"Dune poll error: {e}")
-                await asyncio.sleep(interval)
+        atr = signal.atr
+        if atr <= 0:
+            log.warning(f"ATR=0 for {signal.symbol} — cannot size position.")
+            return
 
-    # ── Alpaca Futures REST poll (ES1!) ───────────────────────────────────────
+        position_size = (equity * risk_pct) / (atr * ATR_MULTIPLIER)
 
-    async def _alpaca_futures_poll(self) -> None:
-        contracts = self.config.get("futures_contracts", ["ES1!"])
-        url_base  = "https://data.alpaca.markets/v2/stocks/{sym}/bars"
-        headers   = {
-            "APCA-API-KEY-ID":     self.config["alpaca_key"],
-            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
+        # We don't have a live entry price here — the OMS will fill it at market.
+        # We estimate entry from the latest close in market data.
+        entry_est = self._latest_price(signal)
+        if entry_est <= 0:
+            return
+
+        if signal.direction == "long":
+            stop  = entry_est - atr * ATR_MULTIPLIER
+            tp    = entry_est + atr * TP_MULTIPLIER
+        else:
+            stop  = entry_est + atr * ATR_MULTIPLIER
+            tp    = entry_est - atr * TP_MULTIPLIER
+
+        rp = RiskParameters(
+            symbol         = signal.symbol,
+            position_size  = round(position_size, 4),
+            entry_price    = entry_est,
+            stop_price     = round(stop, 4),
+            take_profit    = round(tp, 4),
+            kelly_fraction = kelly,
+            max_loss_usd   = round(equity * risk_pct, 2),
+        )
+
+        log.info(
+            f"Risk approved → {rp.symbol} size={rp.position_size} "
+            f"entry~{rp.entry_price:.4f} stop={rp.stop_price:.4f} "
+            f"TP={rp.take_profit:.4f} maxLoss=${rp.max_loss_usd:.2f}"
+        )
+        await self.state.put_order(rp)
+
+    def _kelly_fraction(self) -> float:
+        """
+        Kelly Criterion: f* = (bp - q) / b
+        where b = avg_win/avg_loss, p = win rate, q = 1-p.
+        Falls back to MIN_CONFIDENCE if no history yet.
+        """
+        if len(self._win_history) < 10:
+            return 0.10   # conservative default until we have data
+
+        wins = sum(self._win_history)
+        n    = len(self._win_history)
+        p    = wins / n
+        q    = 1 - p
+
+        avg_win  = self.config.get("avg_win_r",  1.5)  # R multiples
+        avg_loss = self.config.get("avg_loss_r", 1.0)
+        b = avg_win / avg_loss
+
+        if b * p - q <= 0:
+            return 0.01   # negative expectancy — near-zero sizing
+
+        kelly = (b * p - q) / b
+        return min(kelly, MAX_KELLY_FRACTION)
+
+    def record_trade_outcome(self, won: bool) -> None:
+        """Called by the OMS after a trade closes to update Kelly history."""
+        self._win_history.append(won)
+
+    def _latest_price(self, signal: TechnicalSignals) -> float:
+        sector_map = {
+            "crypto":  self.state.market.crypto,
+            "stocks":  self.state.market.stocks,
+            "forex":   self.state.market.forex,
+            "futures": self.state.market.futures,
         }
-        interval = self.config.get("futures_poll_seconds", 60)
-
-        async with aiohttp.ClientSession() as session:
-            while True:
-                for sym in contracts:
-                    try:
-                        async with session.get(
-                            url_base.format(sym=sym),
-                            headers=headers,
-                            params={"timeframe": "5Min", "limit": 200},
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as resp:
-                            data = await resp.json()
-                            bars_raw = data.get("bars", [])
-                            if bars_raw:
-                                self.state.market.futures[sym] = {
-                                    "close":  [b["c"] for b in bars_raw],
-                                    "high":   [b["h"] for b in bars_raw],
-                                    "low":    [b["l"] for b in bars_raw],
-                                    "volume": [b["v"] for b in bars_raw],
-                                }
-                    except Exception as e:
-                        log.warning(f"Futures poll error for {sym}: {e}")
-                await asyncio.sleep(interval)
+        data = sector_map.get(signal.sector, {})
+        bars = data.get(signal.symbol, {})
+        closes = bars.get("close", [])
+        return float(closes[-1]) if closes else 0.0

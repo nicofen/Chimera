@@ -1,85 +1,154 @@
 """
-chimera/server/publisher.py
-StatePublisher — the bridge between SharedState and the WebSocket layer.
+chimera/oms/trailing_stop.py
+Trailing Stop Manager.
 
-Runs as an asyncio task inside the mainframe process.
-Every POLL_INTERVAL seconds it:
-  1. Serializes the current SharedState into a snapshot dict.
-  2. Diffs it against the previous snapshot.
-  3. If anything changed, puts the diff onto a broadcast queue.
-  4. The WebSocket handler drains that queue and sends to all clients.
+Ratchets the stop price upward (for longs) or downward (for shorts)
+as price moves in our favour. Never moves the stop against us.
 
-This decouples the publishing rate from the agent cycle rates —
-agents can update state at any frequency; the dashboard always gets
-a clean 250 ms cadence with no duplicate sends.
+Strategy: ATR-based trailing — stop trails at (current_price - N×ATR).
+Once the trade reaches 1R profit, the stop is moved to breakeven.
+Once the trade reaches 2R profit, the stop trails at 1R profit (locked in).
+
+This gives the trade room to breathe early, then protects gains as they grow.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 from typing import TYPE_CHECKING
 
-from chimera.server.serializer import serialize_state, serialize_diff
-
 if TYPE_CHECKING:
-    from chimera.utils.state import SharedState
+    from chimera.oms.models import Order
 
-log = logging.getLogger("chimera.server.publisher")
+log = logging.getLogger("chimera.oms.trailing_stop")
 
-POLL_INTERVAL = 0.25   # seconds — 4 Hz tick rate to the dashboard
+ATR_TRAIL_MULTIPLE = 2.0   # default: stop trails at 2×ATR behind price
 
 
-class StatePublisher:
+class TrailingStopManager:
     """
-    Owned by the WebSocket server. Call `.run()` as an asyncio task.
-    Consumers read from `.queue` (asyncio.Queue of JSON strings).
+    Called on every price tick for each open position.
+    Returns the new stop price if it should be updated, else None.
     """
 
-    def __init__(self, state: "SharedState"):
-        self.state  = state
-        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
-        self._prev_snapshot: dict = {}
+    def __init__(self, config: dict):
+        self.atr_multiple = config.get("trailing_atr_multiple", ATR_TRAIL_MULTIPLE)
+        self.breakeven_r  = config.get("breakeven_at_r", 1.0)   # move to BE at 1R
+        self.lock_r       = config.get("lock_profit_at_r", 2.0) # lock profit at 2R
 
-    async def run(self) -> None:
-        log.info("StatePublisher started — polling every %.0fms", POLL_INTERVAL * 1000)
-        while True:
-            try:
-                await self._tick()
-            except Exception as e:
-                log.warning(f"StatePublisher tick error: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+    def evaluate(self, order: "Order", current_price: float) -> float | None:
+        """
+        Evaluate whether the trailing stop should move.
 
-    async def _tick(self) -> None:
-        curr = serialize_state(self.state)
+        Returns:
+            float: new stop price if it should be updated (always better than current)
+            None:  no change required
+        """
+        from chimera.oms.models import OrderSide
 
-        if not self._prev_snapshot:
-            # First tick — queue a full snapshot for any waiting clients
-            msg = json.dumps(curr)
-            await self._enqueue(msg)
+        if not order.is_open:
+            return None
+        if order.fill_price <= 0 or order.atr <= 0:
+            return None
+
+        risk_per_unit = abs(order.fill_price - order.initial_stop)
+        if risk_per_unit <= 0:
+            return None
+
+        r_current = self._r_multiple(order, current_price)
+
+        if order.side == OrderSide.BUY:
+            return self._trail_long(order, current_price, r_current, risk_per_unit)
         else:
-            diff = serialize_diff(self._prev_snapshot, curr)
-            # Only broadcast if something actually changed (beyond ts)
-            if len(diff) > 2:
-                msg = json.dumps(diff)
-                await self._enqueue(msg)
+            return self._trail_short(order, current_price, r_current, risk_per_unit)
 
-        self._prev_snapshot = curr
+    # ── Long trailing logic ───────────────────────────────────────────────────
 
-    async def _enqueue(self, msg: str) -> None:
-        try:
-            self.queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            # Drop oldest message to make room — dashboard will catch up
-            try:
-                self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            self.queue.put_nowait(msg)
+    def _trail_long(
+        self,
+        order: "Order",
+        price:  float,
+        r:      float,
+        risk:   float,
+    ) -> float | None:
+        atr = order.atr
 
-    def get_snapshot_json(self) -> str:
-        """Synchronous snapshot for new WebSocket clients joining mid-session."""
-        import json
-        snap = serialize_state(self.state)
-        return json.dumps(snap)
+        # Stage 3: trail at ATR×multiple behind price (standard trailing)
+        trail_stop = price - atr * self.atr_multiple
+
+        # Stage 2: lock in profit — stop never below fill + lock_r × risk
+        if r >= self.lock_r:
+            locked_floor = order.fill_price + self.lock_r * risk * 0.5
+            trail_stop   = max(trail_stop, locked_floor)
+
+        # Stage 1: at breakeven — stop never below fill price
+        if r >= self.breakeven_r:
+            trail_stop = max(trail_stop, order.fill_price)
+
+        # Only ratchet up — never lower the stop on a long
+        if trail_stop > order.stop_price:
+            log.debug(
+                f"Trail [{order.symbol}] long stop {order.stop_price:.4f}"
+                f" → {trail_stop:.4f}  (R={r:.2f})"
+            )
+            return round(trail_stop, 6)
+
+        return None
+
+    # ── Short trailing logic ──────────────────────────────────────────────────
+
+    def _trail_short(
+        self,
+        order: "Order",
+        price:  float,
+        r:      float,
+        risk:   float,
+    ) -> float | None:
+        atr = order.atr
+
+        trail_stop = price + atr * self.atr_multiple
+
+        if r >= self.lock_r:
+            locked_ceil = order.fill_price - self.lock_r * risk * 0.5
+            trail_stop  = min(trail_stop, locked_ceil)
+
+        if r >= self.breakeven_r:
+            trail_stop = min(trail_stop, order.fill_price)
+
+        # Only ratchet down — never raise the stop on a short
+        if trail_stop < order.stop_price:
+            log.debug(
+                f"Trail [{order.symbol}] short stop {order.stop_price:.4f}"
+                f" → {trail_stop:.4f}  (R={r:.2f})"
+            )
+            return round(trail_stop, 6)
+
+        return None
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _r_multiple(order: "Order", current_price: float) -> float:
+        from chimera.oms.models import OrderSide
+        risk = abs(order.fill_price - order.initial_stop)
+        if risk <= 0:
+            return 0.0
+        if order.side == OrderSide.BUY:
+            return (current_price - order.fill_price) / risk
+        return (order.fill_price - current_price) / risk
+
+    def stop_hit(self, order: "Order", current_price: float) -> bool:
+        """Returns True if the current price has crossed through the stop."""
+        from chimera.oms.models import OrderSide
+        if order.side == OrderSide.BUY:
+            return current_price <= order.stop_price
+        return current_price >= order.stop_price
+
+    def tp_hit(self, order: "Order", current_price: float) -> bool:
+        """Returns True if take-profit has been reached."""
+        from chimera.oms.models import OrderSide
+        if order.take_profit <= 0:
+            return False
+        if order.side == OrderSide.BUY:
+            return current_price >= order.take_profit
+        return current_price <= order.take_profit

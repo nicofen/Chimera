@@ -1,164 +1,229 @@
 """
-chimera/agents/news_agent.py
-News Agent — polls FinancialJuice and Stocktwits, runs LLM-based NLP
-classification, sets confidence intervals, and raises macro veto flags.
+chimera/agents/data_agent.py
+Data Agent — manages all market data ingestion.
 
-The veto system is the most important safety mechanism in Chimera:
-if a high-impact Fed / CPI / NFP event is detected, ALL technical signals
-are suppressed until the dust settles (configurable cool-down window).
+WebSocket streams: Alpaca (stocks, forex, futures), crypto exchange WS.
+REST polling:      Whale Alert, CoinMarketCap, Dune Analytics, Finviz, Stocktwits.
+
+Writes normalized OHLCV + metadata bars into state.market.{sector}.
 """
 
 import asyncio
-import re
-from datetime import datetime
+import json
+import time
 from typing import Any
 
 import aiohttp
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+import websockets
 
-from chimera.utils.state import SharedState, NewsState, Sentiment
+from chimera.utils.state import SharedState
 from chimera.utils.logger import setup_logger
 
-log = setup_logger("news_agent")
+log = setup_logger("data_agent")
 
-# ── Veto keywords ──────────────────────────────────────────────────────────────
-VETO_PATTERNS = [
-    r"fed\s+(decision|meeting|statement|chair|powell)",
-    r"fomc",
-    r"nonfarm\s+payroll|nfp",
-    r"cpi|pce|inflation\s+data",
-    r"rate\s+(hike|cut|hold|decision)",
-    r"emergency\s+(rate|fed|meeting)",
-    r"bank\s+of\s+(england|japan|ecb|europe)\s+(decision|hike|cut)",
-]
-HAWKISH_KEYWORDS = ["hawkish", "rate hike", "tighten", "inflation concerns", "restrict"]
-BEARISH_KEYWORDS = ["rate cut", "dovish", "recession", "layoffs", "credit event", "default"]
-
-_VETO_RE = re.compile("|".join(VETO_PATTERNS), re.IGNORECASE)
+ALPACA_WS_URL    = "wss://stream.data.alpaca.markets/v2/iex"
+ALPACA_CRYPTO_WS = "wss://stream.data.alpaca.markets/v1beta3/crypto/us"
 
 
-class NewsAgent:
+class DataAgent:
     """
-    Autonomous News Agent.
-    1. Polls REST endpoints on a configurable interval.
-    2. Passes headlines through an LLM classifier (LangChain + OpenAI).
-    3. Writes Sentiment + CI score to shared state.
-    4. Sets veto_active=True if macro event keywords are detected.
+    Runs all ingestor coroutines concurrently.
+    Each ingestor writes directly into the shared state's market dicts.
     """
-
-    SYSTEM_PROMPT = """You are a quantitative trading news analyst.
-Classify the following financial headline(s) and return ONLY valid JSON:
-{
-  "sentiment": "bullish" | "bearish" | "neutral",
-  "confidence": <float 0.0–1.0>,
-  "macro_event": <bool>,
-  "macro_reason": "<string, empty if not macro>"
-}
-Be conservative: a single ambiguous headline should return neutral with low confidence.
-High-impact macro events (FOMC, CPI, NFP) must set macro_event=true regardless of direction."""
 
     def __init__(self, state: SharedState, config: dict[str, Any]):
         self.state  = state
         self.config = config
-        self.poll_interval = config.get("news_poll_seconds", 30)
-        self.veto_cooldown = config.get("veto_cooldown_seconds", 600)  # 10 min default
-        self._veto_until: datetime | None = None
-
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            api_key=config["openai_api_key"],
-        )
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", self.SYSTEM_PROMPT),
-            ("human", "Headlines:\n{headlines}"),
-        ])
-        self._chain = prompt | llm | JsonOutputParser()
 
     async def run(self) -> None:
-        log.info("NewsAgent started.")
+        log.info("DataAgent started.")
+        await asyncio.gather(
+            self._alpaca_stocks_ws(),
+            self._alpaca_crypto_ws(),
+            self._whale_alert_poll(),
+            self._finviz_poll(),
+            self._dune_poll(),
+            self._alpaca_futures_poll(),
+        )
+
+    # ── Alpaca Stocks WebSocket ───────────────────────────────────────────────
+
+    async def _alpaca_stocks_ws(self) -> None:
+        symbols = self.config.get("stock_symbols", ["AAPL", "TSLA", "GME"])
+        headers = {
+            "APCA-API-KEY-ID":     self.config["alpaca_key"],
+            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
+        }
+        while True:
+            try:
+                async with websockets.connect(ALPACA_WS_URL, extra_headers=headers) as ws:
+                    await ws.send(json.dumps({
+                        "action": "subscribe",
+                        "bars":   symbols,
+                        "trades": symbols,
+                    }))
+                    async for raw in ws:
+                        msgs = json.loads(raw)
+                        for msg in msgs:
+                            if msg.get("T") == "b":   # bar message
+                                sym = msg["S"]
+                                bars = self.state.market.stocks.setdefault(sym, {
+                                    "close": [], "high": [], "low": [], "volume": []
+                                })
+                                bars["close"].append(float(msg["c"]))
+                                bars["high"].append(float(msg["h"]))
+                                bars["low"].append(float(msg["l"]))
+                                bars["volume"].append(float(msg["v"]))
+                                # Keep a rolling 500-bar window
+                                for k in bars:
+                                    bars[k] = bars[k][-500:]
+            except Exception as e:
+                log.warning(f"Stocks WS error: {e} — reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    # ── Alpaca Crypto WebSocket ───────────────────────────────────────────────
+
+    async def _alpaca_crypto_ws(self) -> None:
+        symbols = self.config.get("crypto_symbols", ["BTC/USD", "ETH/USD", "SOL/USD"])
+        headers = {
+            "APCA-API-KEY-ID":     self.config["alpaca_key"],
+            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
+        }
+        while True:
+            try:
+                async with websockets.connect(ALPACA_CRYPTO_WS, extra_headers=headers) as ws:
+                    await ws.send(json.dumps({"action": "subscribe", "bars": symbols}))
+                    async for raw in ws:
+                        msgs = json.loads(raw)
+                        for msg in msgs:
+                            if msg.get("T") == "b":
+                                sym = msg["S"]
+                                bars = self.state.market.crypto.setdefault(sym, {
+                                    "close": [], "high": [], "low": [], "volume": []
+                                })
+                                bars["close"].append(float(msg["c"]))
+                                bars["high"].append(float(msg["h"]))
+                                bars["low"].append(float(msg["l"]))
+                                bars["volume"].append(float(msg["v"]))
+                                for k in bars:
+                                    bars[k] = bars[k][-500:]
+            except Exception as e:
+                log.warning(f"Crypto WS error: {e} — reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    # ── Whale Alert REST poll ─────────────────────────────────────────────────
+
+    async def _whale_alert_poll(self) -> None:
+        url      = "https://api.whale-alert.io/v1/transactions"
+        api_key  = self.config.get("whale_alert_key", "")
+        interval = self.config.get("whale_poll_seconds", 60)
+
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    headlines = await self._fetch_all(session)
-                    if headlines:
-                        await self._classify_and_update(headlines)
+                    params = {
+                        "api_key":   api_key,
+                        "cursor":    int(time.time()) - interval,
+                        "min_value": 1_000_000,
+                        "limit":     100,
+                    }
+                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        data = await resp.json()
+                        inflow = sum(
+                            tx["amount_usd"]
+                            for tx in data.get("transactions", [])
+                            if tx.get("to", {}).get("owner_type") == "exchange"
+                            and tx.get("symbol", "").upper() == "BTC"
+                        )
+                        self.state.market.crypto["btc_exchange_inflow"] = inflow
+                        log.debug(f"BTC exchange inflow (last {interval}s): ${inflow:,.0f}")
                 except Exception as e:
-                    log.warning(f"NewsAgent poll error: {e}")
-                await asyncio.sleep(self.poll_interval)
+                    log.warning(f"Whale Alert poll error: {e}")
+                await asyncio.sleep(interval)
 
-    # ── Fetchers ───────────────────────────────────────────────────────────────
+    # ── Finviz screener poll (short interest + RVOL) ─────────────────────────
 
-    async def _fetch_all(self, session: aiohttp.ClientSession) -> list[str]:
-        results = await asyncio.gather(
-            self._fetch_financial_juice(session),
-            self._fetch_stocktwits(session),
-            return_exceptions=True,
-        )
-        headlines: list[str] = []
-        for r in results:
-            if isinstance(r, list):
-                headlines.extend(r)
-        return headlines[:20]  # cap to keep LLM token cost low
-
-    async def _fetch_financial_juice(self, session: aiohttp.ClientSession) -> list[str]:
+    async def _finviz_poll(self) -> None:
         """
-        FinancialJuice provides a free headline RSS / JSON feed.
-        Replace the URL with their paid API endpoint if you have a key.
+        Uses finviz Python library (pip install finviz) to screen for
+        high short-interest, high RVOL candidates every 5 minutes.
         """
-        url = self.config.get("financialjuice_url", "https://www.financialjuice.com/feed.ashx?c=market")
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            data = await resp.json(content_type=None)
-            return [item.get("title", "") for item in data.get("items", [])[:10]]
-
-    async def _fetch_stocktwits(self, session: aiohttp.ClientSession) -> list[str]:
-        """Stocktwits trending stream — no API key required for public feed."""
-        url = "https://api.stocktwits.com/api/2/streams/trending.json"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            data = await resp.json()
-            messages = data.get("messages", [])
-            return [m.get("body", "") for m in messages[:10]]
-
-    # ── Classification ─────────────────────────────────────────────────────────
-
-    async def _classify_and_update(self, headlines: list[str]) -> None:
-        combined = "\n".join(f"- {h}" for h in headlines if h.strip())
-
-        # Fast regex veto check (don't spend LLM tokens if pattern match fires)
-        if _VETO_RE.search(combined):
-            await self._raise_veto(combined)
+        try:
+            import finviz
+        except ImportError:
+            log.warning("finviz not installed — skipping stock screener.")
             return
 
-        result: dict[str, Any] = await self._chain.ainvoke({"headlines": combined})
+        interval = self.config.get("finviz_poll_seconds", 300)
+        filters  = ["sh_short_o20", "ta_relvol_o3"]   # SI > 20%, RVOL > 3
 
-        sentiment_str = result.get("sentiment", "neutral").lower()
-        confidence    = float(result.get("confidence", 0.5))
-        macro_event   = bool(result.get("macro_event", False))
-        macro_reason  = result.get("macro_reason", "")
+        while True:
+            try:
+                results = finviz.get_screener(filters=filters, table="Performance")
+                for row in results[:20]:
+                    sym = row.get("Ticker", "")
+                    if sym in self.state.market.stocks:
+                        self.state.market.stocks[sym]["short_interest"] = (
+                            float(str(row.get("Short Float", "0")).strip("%")) / 100
+                        )
+                        self.state.market.stocks[sym]["rvol"] = float(row.get("Rel Volume", 1.0))
+            except Exception as e:
+                log.warning(f"Finviz poll error: {e}")
+            await asyncio.sleep(interval)
 
-        if macro_event:
-            await self._raise_veto(macro_reason or combined)
-            return
+    # ── Dune Analytics poll (Solana memecoin volume) ─────────────────────────
 
-        self.state.news = NewsState(
-            sentiment    = Sentiment(sentiment_str),
-            confidence   = confidence,
-            veto_active  = False,
-            last_updated = datetime.utcnow(),
-        )
-        log.info(f"News: {sentiment_str} CI={confidence:.2f}")
+    async def _dune_poll(self) -> None:
+        dune_key = self.config.get("dune_api_key", "")
+        query_id = self.config.get("dune_memecoin_query_id", "3152691")  # memecoin wars
+        interval = self.config.get("dune_poll_seconds", 300)
+        url      = f"https://api.dune.com/api/v1/query/{query_id}/results"
 
-    async def _raise_veto(self, reason: str) -> None:
-        from datetime import timedelta
-        self._veto_until = datetime.utcnow() + timedelta(seconds=self.veto_cooldown)
-        self.state.news.veto_active = True
-        self.state.news.veto_reason = reason[:120]
-        log.warning(f"VETO RAISED — {reason[:80]}... (cool-down {self.veto_cooldown}s)")
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    headers = {"X-Dune-API-Key": dune_key}
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        data  = await resp.json()
+                        rows  = data.get("result", {}).get("rows", [])
+                        vol   = sum(r.get("volume_usd", 0) for r in rows[:10])
+                        spike = vol > self.config.get("sol_memecoin_spike_threshold", 50_000_000)
+                        self.state.market.crypto["sol_memecoin_vol_spike"] = spike
+                        log.debug(f"Sol memecoin vol: ${vol:,.0f} spike={spike}")
+                except Exception as e:
+                    log.warning(f"Dune poll error: {e}")
+                await asyncio.sleep(interval)
 
-        # Auto-clear after cool-down
-        await asyncio.sleep(self.veto_cooldown)
-        self.state.news.veto_active = False
-        self.state.news.veto_reason = ""
-        log.info("Veto cleared — signals re-enabled.")
+    # ── Alpaca Futures REST poll (ES1!) ───────────────────────────────────────
+
+    async def _alpaca_futures_poll(self) -> None:
+        contracts = self.config.get("futures_contracts", ["ES1!"])
+        url_base  = "https://data.alpaca.markets/v2/stocks/{sym}/bars"
+        headers   = {
+            "APCA-API-KEY-ID":     self.config["alpaca_key"],
+            "APCA-API-SECRET-KEY": self.config["alpaca_secret"],
+        }
+        interval = self.config.get("futures_poll_seconds", 60)
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                for sym in contracts:
+                    try:
+                        async with session.get(
+                            url_base.format(sym=sym),
+                            headers=headers,
+                            params={"timeframe": "5Min", "limit": 200},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            data = await resp.json()
+                            bars_raw = data.get("bars", [])
+                            if bars_raw:
+                                self.state.market.futures[sym] = {
+                                    "close":  [b["c"] for b in bars_raw],
+                                    "high":   [b["h"] for b in bars_raw],
+                                    "low":    [b["l"] for b in bars_raw],
+                                    "volume": [b["v"] for b in bars_raw],
+                                }
+                    except Exception as e:
+                        log.warning(f"Futures poll error for {sym}: {e}")
+                await asyncio.sleep(interval)
