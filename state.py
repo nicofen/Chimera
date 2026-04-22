@@ -1,81 +1,85 @@
 """
-Project Chimera — Mainframe.py
-Orchestrator: boots DataAgent, StrategyAgent, and RiskAgent as asyncio tasks.
-The shared State Dictionary bridges all three layers.
-The News Agent can veto any technical signal before it reaches the OMS.
+chimera/server/publisher.py
+StatePublisher — the bridge between SharedState and the WebSocket layer.
+
+Runs as an asyncio task inside the mainframe process.
+Every POLL_INTERVAL seconds it:
+  1. Serializes the current SharedState into a snapshot dict.
+  2. Diffs it against the previous snapshot.
+  3. If anything changed, puts the diff onto a broadcast queue.
+  4. The WebSocket handler drains that queue and sends to all clients.
+
+This decouples the publishing rate from the agent cycle rates —
+agents can update state at any frequency; the dashboard always gets
+a clean 250 ms cadence with no duplicate sends.
 """
 
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING
 
-from chimera.agents.data_agent import DataAgent
-from chimera.agents.strategy_agent import StrategyAgent
-from chimera.agents.risk_agent import RiskAgent
-from chimera.agents.news_agent import NewsAgent
-from chimera.oms.order_manager import OrderManager
-from chimera.utils.state import SharedState
-from chimera.utils.logger import setup_logger
+from chimera.server.serializer import serialize_state, serialize_diff
 
-log = setup_logger("mainframe")
+if TYPE_CHECKING:
+    from chimera.utils.state import SharedState
+
+log = logging.getLogger("chimera.server.publisher")
+
+POLL_INTERVAL = 0.25   # seconds — 4 Hz tick rate to the dashboard
 
 
-class Mainframe:
+class StatePublisher:
     """
-    Top-level orchestrator. Creates one shared state object and passes it to
-    every agent. Agents communicate exclusively through state — never by calling
-    each other directly. This keeps the architecture loosely coupled and makes
-    individual agents testable in isolation.
+    Owned by the WebSocket server. Call `.run()` as an asyncio task.
+    Consumers read from `.queue` (asyncio.Queue of JSON strings).
     """
 
-    def __init__(self, config: dict[str, Any]):
-        self.config = config
-        self.state = SharedState()
-        self._tasks: list[asyncio.Task] = []
-
-        # Instantiate agents, all sharing the same state reference
-        self.data_agent     = DataAgent(self.state, config)
-        self.news_agent     = NewsAgent(self.state, config)
-        self.strategy_agent = StrategyAgent(self.state, config)
-        self.risk_agent     = RiskAgent(self.state, config)
-        self.order_manager  = OrderManager(self.state, config)
+    def __init__(self, state: "SharedState"):
+        self.state  = state
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._prev_snapshot: dict = {}
 
     async def run(self) -> None:
-        log.info("╔══════════════════════════════════╗")
-        log.info("║   Project Chimera — MAINFRAME     ║")
-        log.info("╚══════════════════════════════════╝")
-        log.info(f"Boot time: {datetime.utcnow().isoformat()}Z")
-        log.info(f"Mode: {self.config.get('mode', 'paper')}")
+        log.info("StatePublisher started — polling every %.0fms", POLL_INTERVAL * 1000)
+        while True:
+            try:
+                await self._tick()
+            except Exception as e:
+                log.warning(f"StatePublisher tick error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
-        self._tasks = [
-            asyncio.create_task(self.data_agent.run(),     name="DataAgent"),
-            asyncio.create_task(self.news_agent.run(),     name="NewsAgent"),
-            asyncio.create_task(self.strategy_agent.run(), name="StrategyAgent"),
-            asyncio.create_task(self.risk_agent.run(),     name="RiskAgent"),
-            asyncio.create_task(self.order_manager.run(),  name="OrderManager"),
-        ]
+    async def _tick(self) -> None:
+        curr = serialize_state(self.state)
 
+        if not self._prev_snapshot:
+            # First tick — queue a full snapshot for any waiting clients
+            msg = json.dumps(curr)
+            await self._enqueue(msg)
+        else:
+            diff = serialize_diff(self._prev_snapshot, curr)
+            # Only broadcast if something actually changed (beyond ts)
+            if len(diff) > 2:
+                msg = json.dumps(diff)
+                await self._enqueue(msg)
+
+        self._prev_snapshot = curr
+
+    async def _enqueue(self, msg: str) -> None:
         try:
-            await asyncio.gather(*self._tasks)
-        except asyncio.CancelledError:
-            log.warning("Mainframe received shutdown signal.")
-        except Exception as e:
-            log.exception(f"Fatal error in mainframe: {e}")
-        finally:
-            await self._shutdown()
+            self.queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            # Drop oldest message to make room — dashboard will catch up
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self.queue.put_nowait(msg)
 
-    async def _shutdown(self) -> None:
-        log.info("Shutting down all agents...")
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        log.info("All agents halted. Goodbye.")
-
-
-if __name__ == "__main__":
-    from chimera.config.settings import load_config
-
-    cfg = load_config()
-    mainframe = Mainframe(cfg)
-    asyncio.run(mainframe.run())
+    def get_snapshot_json(self) -> str:
+        """Synchronous snapshot for new WebSocket clients joining mid-session."""
+        import json
+        snap = serialize_state(self.state)
+        return json.dumps(snap)

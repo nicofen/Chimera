@@ -1,89 +1,88 @@
-# Project Chimera
+"""
+chimera/config/settings.py
+Load configuration from environment variables or a .env file.
 
-Institutional-grade, multi-asset trading mainframe built on an async
-Producer-Consumer microservices architecture.
+ALWAYS start with mode="paper" until you have 3+ months of
+consistent paper-trading P&L. Use mode="live" only when you
+are prepared to manage real capital drawdowns.
+"""
 
-## Architecture
+import os
+from typing import Any
 
-```
-Ingestor Layer   →  DataAgent (WebSocket + REST)
-                    NewsAgent (LLM NLP + Veto)
-         ↓
-Processor Layer  →  StrategyAgent (TA Engine + Sp Score)
-                    RiskAgent (Kelly + ATR Stops)
-         ↓
-Executor Layer   →  OMS (Alpaca REST + Trade Logger)
-```
 
-## Quick Start
+def load_config() -> dict[str, Any]:
+    """
+    Returns the Chimera configuration dict.
+    Secrets are read from environment variables — never hardcode them.
 
-```bash
-# 1. Create a virtual environment
-python -m venv .venv && source .venv/bin/activate
+    Required env vars:
+      ALPACA_KEY, ALPACA_SECRET, OPENAI_API_KEY
 
-# 2. Install dependencies
-pip install -r requirements.txt
+    Optional:
+      WHALE_ALERT_KEY, CMC_API_KEY, DUNE_API_KEY, FINANCIALJUICE_URL
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
-# 3. Create your .env file (never commit this)
-cat > .env << EOF
-ALPACA_KEY=your_alpaca_key
-ALPACA_SECRET=your_alpaca_secret
-OPENAI_API_KEY=your_openai_key
-WHALE_ALERT_KEY=your_whale_alert_key   # optional
-DUNE_API_KEY=your_dune_key             # optional
-CHIMERA_MODE=paper                     # ALWAYS start with paper
-EOF
+    return {
+        # ── Mode ──────────────────────────────────────────────────────────────
+        "mode": os.getenv("CHIMERA_MODE", "paper"),   # "paper" | "live"
 
-# 4. Run the mainframe
-python -m chimera.mainframe
-```
+        # ── API Keys ──────────────────────────────────────────────────────────
+        "alpaca_key":    os.environ["ALPACA_KEY"],
+        "alpaca_secret": os.environ["ALPACA_SECRET"],
+        "openai_api_key": os.environ["OPENAI_API_KEY"],
+        "whale_alert_key":  os.getenv("WHALE_ALERT_KEY", ""),
+        "cmc_api_key":      os.getenv("CMC_API_KEY", ""),
+        "dune_api_key":     os.getenv("DUNE_API_KEY", ""),
+        "financialjuice_url": os.getenv(
+            "FINANCIALJUICE_URL",
+            "https://www.financialjuice.com/feed.ashx?c=market",
+        ),
 
-## The Four Pillars
+        # ── Symbols ───────────────────────────────────────────────────────────
+        "stock_symbols":      ["AAPL", "TSLA", "GME", "AMC", "BBBY"],
+        "crypto_symbols":     ["BTC/USD", "ETH/USD", "SOL/USD"],
+        "forex_pairs":        ["EUR/USD", "GBP/USD", "USD/JPY"],
+        "futures_contracts":  ["ES1!"],
 
-| Sector  | Edge                         | Key Data Sources              |
-|---------|------------------------------|-------------------------------|
-| Crypto  | Exchange inflow/outflow      | Whale Alert, Dune, Alpaca WS  |
-| Stocks  | Short Squeeze (Sp score)     | Finviz, Stocktwits, Alpaca    |
-| Forex   | NLP momentum on EMA          | FinancialJuice, Alpaca        |
-| Futures | Value Area mean reversion    | Alpaca CME, AVWAP             |
+        # ── Risk ──────────────────────────────────────────────────────────────
+        "base_risk_pct":    0.01,   # 1% of equity per trade (paper trading default)
+        "kelly_lookback":   50,     # trades to include in Kelly calculation
+        "avg_win_r":        1.5,    # expected win in R-multiples
+        "avg_loss_r":       1.0,    # expected loss in R-multiples
 
-## Squeeze Probability Score
+        # ── Strategy thresholds ───────────────────────────────────────────────
+        "min_sp_score":            0.60,   # minimum Sp to act on a squeeze
+        "btc_inflow_threshold":    1_000_000,  # USD — risk-off trigger
+        "sol_memecoin_spike_threshold": 50_000_000,  # USD 24h vol
 
-```
-Sp = (SI × 0.4) + (V_velocity × 0.3) + (S_sentiment × 0.3)
-```
+        # ── Polling intervals (seconds) ───────────────────────────────────────
+        "news_poll_seconds":    30,
+        "strategy_interval_seconds": 15,
+        "whale_poll_seconds":   60,
+        "finviz_poll_seconds":  300,
+        "dune_poll_seconds":    300,
+        "futures_poll_seconds": 60,
 
-Where:
-- `SI`          = Normalised short interest (0–1, cap at 50%)
-- `V_velocity`  = Normalised relative volume (RVOL 1–10 → 0–1)
-- `S_sentiment` = Normalised Z-score of social mentions (0–5 → 0–1)
+        # ── News / veto ───────────────────────────────────────────────────────
+        "veto_cooldown_seconds": 600,   # 10 minutes of silence after macro event
 
-Signals with Sp < 0.60 are discarded. Sp > 0.75 triggers a long.
+        # ── API server
+        "api_host": os.getenv("CHIMERA_API_HOST", "0.0.0.0"),
+        "api_port": int(os.getenv("CHIMERA_API_PORT", "8765")),
 
-## Position Sizing
+        # ── Dune query IDs ────────────────────────────────────────────────────
+        "dune_memecoin_query_id": "3152691",
+    }
 
-```
-Position Size = (Account Equity × Risk%) / (ATR × 2)
-```
-
-Risk% is bounded by:
-1. `base_risk_pct` from config (default 1%)
-2. Kelly Criterion (computed from rolling 50-trade win history)
-3. News Agent confidence multiplier (0 during veto)
-
-## The Veto System
-
-The News Agent raises `veto_active = True` when any of the following are
-detected in FinancialJuice or Stocktwits headlines:
-- FOMC / Fed meeting / rate decision
-- CPI / PCE / NFP releases
-- Emergency central bank actions
-
-All pending signals are **dropped** and the system stays in cash for a
-configurable cool-down window (default: 10 minutes).
-
-## Important Warning
-
-Past performance of any trading strategy is not indicative of future results.
-Always paper-trade for a minimum of 3 months before risking real capital.
-Never risk more than you can afford to lose entirely.
+def api_defaults() -> dict:
+    """Merge these into load_config() return value."""
+    return {
+        "api_host": os.getenv("CHIMERA_API_HOST", "0.0.0.0"),
+        "api_port": int(os.getenv("CHIMERA_API_PORT", "8765")),
+    }

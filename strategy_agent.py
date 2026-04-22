@@ -1,1 +1,1 @@
-# chimera/config/__init__.py
+# chimera/agents/__init__.py

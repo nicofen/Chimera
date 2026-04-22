@@ -1,164 +1,164 @@
 """
-chimera/agents/risk_agent.py
-Risk Agent — consumes TechnicalSignals from the queue, computes optimal
-position size (Kelly Criterion), sets ATR-based stops, and dispatches
-RiskParameters to the Order Queue for the OMS.
+chimera/agents/news_agent.py
+News Agent — polls FinancialJuice and Stocktwits, runs LLM-based NLP
+classification, sets confidence intervals, and raises macro veto flags.
 
-The position sizing formula:
-    Position Size = (Account Equity × Risk%) / (ATR × ATR_Multiplier)
-
-Kelly fraction is computed from the agent's rolling win/loss history and
-used as a ceiling on position size — never bet more than Kelly suggests.
+The veto system is the most important safety mechanism in Chimera:
+if a high-impact Fed / CPI / NFP event is detected, ALL technical signals
+are suppressed until the dust settles (configurable cool-down window).
 """
 
 import asyncio
-from collections import deque
+import re
 from datetime import datetime
 from typing import Any
 
-from chimera.utils.state import SharedState, TechnicalSignals, RiskParameters
+import aiohttp
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+
+from chimera.utils.state import SharedState, NewsState, Sentiment
 from chimera.utils.logger import setup_logger
 
-log = setup_logger("risk_agent")
+log = setup_logger("news_agent")
+
+# ── Veto keywords ──────────────────────────────────────────────────────────────
+VETO_PATTERNS = [
+    r"fed\s+(decision|meeting|statement|chair|powell)",
+    r"fomc",
+    r"nonfarm\s+payroll|nfp",
+    r"cpi|pce|inflation\s+data",
+    r"rate\s+(hike|cut|hold|decision)",
+    r"emergency\s+(rate|fed|meeting)",
+    r"bank\s+of\s+(england|japan|ecb|europe)\s+(decision|hike|cut)",
+]
+HAWKISH_KEYWORDS = ["hawkish", "rate hike", "tighten", "inflation concerns", "restrict"]
+BEARISH_KEYWORDS = ["rate cut", "dovish", "recession", "layoffs", "credit event", "default"]
+
+_VETO_RE = re.compile("|".join(VETO_PATTERNS), re.IGNORECASE)
 
 
-# ── Hard limits — override these in config, never remove them ─────────────────
-MAX_RISK_PER_TRADE  = 0.02    # 2% of equity maximum
-MAX_KELLY_FRACTION  = 0.25    # never bet more than 25% Kelly even if math allows
-ATR_MULTIPLIER      = 2.0     # stop = entry ± ATR × 2
-TP_MULTIPLIER       = 3.0     # take-profit = entry ± ATR × 3  (1:1.5 R:R minimum)
-MIN_CONFIDENCE      = 0.50    # discard signals below this confidence threshold
-
-
-class RiskAgent:
+class NewsAgent:
     """
-    Sits between StrategyAgent and the OMS.
-
-    Flow:
-        TechnicalSignals queue → Kelly sizing → ATR stop/TP → RiskParameters queue
+    Autonomous News Agent.
+    1. Polls REST endpoints on a configurable interval.
+    2. Passes headlines through an LLM classifier (LangChain + OpenAI).
+    3. Writes Sentiment + CI score to shared state.
+    4. Sets veto_active=True if macro event keywords are detected.
     """
+
+    SYSTEM_PROMPT = """You are a quantitative trading news analyst.
+Classify the following financial headline(s) and return ONLY valid JSON:
+{
+  "sentiment": "bullish" | "bearish" | "neutral",
+  "confidence": <float 0.0–1.0>,
+  "macro_event": <bool>,
+  "macro_reason": "<string, empty if not macro>"
+}
+Be conservative: a single ambiguous headline should return neutral with low confidence.
+High-impact macro events (FOMC, CPI, NFP) must set macro_event=true regardless of direction."""
 
     def __init__(self, state: SharedState, config: dict[str, Any]):
         self.state  = state
         self.config = config
+        self.poll_interval = config.get("news_poll_seconds", 30)
+        self.veto_cooldown = config.get("veto_cooldown_seconds", 600)  # 10 min default
+        self._veto_until: datetime | None = None
 
-        # Rolling performance window for Kelly Criterion
-        self._win_history: deque[bool] = deque(
-            maxlen=config.get("kelly_lookback", 50)
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            api_key=config["openai_api_key"],
         )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", self.SYSTEM_PROMPT),
+            ("human", "Headlines:\n{headlines}"),
+        ])
+        self._chain = prompt | llm | JsonOutputParser()
 
     async def run(self) -> None:
-        log.info("RiskAgent started — waiting for signals.")
-        while True:
-            try:
-                signal: TechnicalSignals = await asyncio.wait_for(
-                    self.state.signal_queue.get(), timeout=5.0
-                )
-                await self._process(signal)
-            except asyncio.TimeoutError:
-                pass   # no signal — loop back
-            except Exception as e:
-                log.warning(f"RiskAgent error: {e}")
+        log.info("NewsAgent started.")
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    headlines = await self._fetch_all(session)
+                    if headlines:
+                        await self._classify_and_update(headlines)
+                except Exception as e:
+                    log.warning(f"NewsAgent poll error: {e}")
+                await asyncio.sleep(self.poll_interval)
 
-    async def _process(self, signal: TechnicalSignals) -> None:
-        # Re-check veto (signal could have been queued just before veto raised)
-        if self.state.is_vetoed():
-            log.info(f"Dropping signal {signal.symbol} — veto active.")
-            return
+    # ── Fetchers ───────────────────────────────────────────────────────────────
 
-        if signal.confidence < MIN_CONFIDENCE:
-            log.debug(f"Dropping {signal.symbol} — confidence {signal.confidence:.2f} below threshold.")
-            return
-
-        equity      = self.state.equity
-        if equity <= 0:
-            log.warning("Equity not set in state — skipping.")
-            return
-
-        kelly       = self._kelly_fraction()
-        risk_pct    = min(
-            self.config.get("base_risk_pct", 0.01),
-            MAX_RISK_PER_TRADE,
-            kelly,
+    async def _fetch_all(self, session: aiohttp.ClientSession) -> list[str]:
+        results = await asyncio.gather(
+            self._fetch_financial_juice(session),
+            self._fetch_stocktwits(session),
+            return_exceptions=True,
         )
-        risk_pct   *= self.state.news_multiplier()   # News Agent multiplier applied here
+        headlines: list[str] = []
+        for r in results:
+            if isinstance(r, list):
+                headlines.extend(r)
+        return headlines[:20]  # cap to keep LLM token cost low
 
-        # Apply signal confidence as a further scalar
-        risk_pct   *= signal.confidence
-
-        atr = signal.atr
-        if atr <= 0:
-            log.warning(f"ATR=0 for {signal.symbol} — cannot size position.")
-            return
-
-        position_size = (equity * risk_pct) / (atr * ATR_MULTIPLIER)
-
-        # We don't have a live entry price here — the OMS will fill it at market.
-        # We estimate entry from the latest close in market data.
-        entry_est = self._latest_price(signal)
-        if entry_est <= 0:
-            return
-
-        if signal.direction == "long":
-            stop  = entry_est - atr * ATR_MULTIPLIER
-            tp    = entry_est + atr * TP_MULTIPLIER
-        else:
-            stop  = entry_est + atr * ATR_MULTIPLIER
-            tp    = entry_est - atr * TP_MULTIPLIER
-
-        rp = RiskParameters(
-            symbol         = signal.symbol,
-            position_size  = round(position_size, 4),
-            entry_price    = entry_est,
-            stop_price     = round(stop, 4),
-            take_profit    = round(tp, 4),
-            kelly_fraction = kelly,
-            max_loss_usd   = round(equity * risk_pct, 2),
-        )
-
-        log.info(
-            f"Risk approved → {rp.symbol} size={rp.position_size} "
-            f"entry~{rp.entry_price:.4f} stop={rp.stop_price:.4f} "
-            f"TP={rp.take_profit:.4f} maxLoss=${rp.max_loss_usd:.2f}"
-        )
-        await self.state.put_order(rp)
-
-    def _kelly_fraction(self) -> float:
+    async def _fetch_financial_juice(self, session: aiohttp.ClientSession) -> list[str]:
         """
-        Kelly Criterion: f* = (bp - q) / b
-        where b = avg_win/avg_loss, p = win rate, q = 1-p.
-        Falls back to MIN_CONFIDENCE if no history yet.
+        FinancialJuice provides a free headline RSS / JSON feed.
+        Replace the URL with their paid API endpoint if you have a key.
         """
-        if len(self._win_history) < 10:
-            return 0.10   # conservative default until we have data
+        url = self.config.get("financialjuice_url", "https://www.financialjuice.com/feed.ashx?c=market")
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            data = await resp.json(content_type=None)
+            return [item.get("title", "") for item in data.get("items", [])[:10]]
 
-        wins = sum(self._win_history)
-        n    = len(self._win_history)
-        p    = wins / n
-        q    = 1 - p
+    async def _fetch_stocktwits(self, session: aiohttp.ClientSession) -> list[str]:
+        """Stocktwits trending stream — no API key required for public feed."""
+        url = "https://api.stocktwits.com/api/2/streams/trending.json"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            data = await resp.json()
+            messages = data.get("messages", [])
+            return [m.get("body", "") for m in messages[:10]]
 
-        avg_win  = self.config.get("avg_win_r",  1.5)  # R multiples
-        avg_loss = self.config.get("avg_loss_r", 1.0)
-        b = avg_win / avg_loss
+    # ── Classification ─────────────────────────────────────────────────────────
 
-        if b * p - q <= 0:
-            return 0.01   # negative expectancy — near-zero sizing
+    async def _classify_and_update(self, headlines: list[str]) -> None:
+        combined = "\n".join(f"- {h}" for h in headlines if h.strip())
 
-        kelly = (b * p - q) / b
-        return min(kelly, MAX_KELLY_FRACTION)
+        # Fast regex veto check (don't spend LLM tokens if pattern match fires)
+        if _VETO_RE.search(combined):
+            await self._raise_veto(combined)
+            return
 
-    def record_trade_outcome(self, won: bool) -> None:
-        """Called by the OMS after a trade closes to update Kelly history."""
-        self._win_history.append(won)
+        result: dict[str, Any] = await self._chain.ainvoke({"headlines": combined})
 
-    def _latest_price(self, signal: TechnicalSignals) -> float:
-        sector_map = {
-            "crypto":  self.state.market.crypto,
-            "stocks":  self.state.market.stocks,
-            "forex":   self.state.market.forex,
-            "futures": self.state.market.futures,
-        }
-        data = sector_map.get(signal.sector, {})
-        bars = data.get(signal.symbol, {})
-        closes = bars.get("close", [])
-        return float(closes[-1]) if closes else 0.0
+        sentiment_str = result.get("sentiment", "neutral").lower()
+        confidence    = float(result.get("confidence", 0.5))
+        macro_event   = bool(result.get("macro_event", False))
+        macro_reason  = result.get("macro_reason", "")
+
+        if macro_event:
+            await self._raise_veto(macro_reason or combined)
+            return
+
+        self.state.news = NewsState(
+            sentiment    = Sentiment(sentiment_str),
+            confidence   = confidence,
+            veto_active  = False,
+            last_updated = datetime.utcnow(),
+        )
+        log.info(f"News: {sentiment_str} CI={confidence:.2f}")
+
+    async def _raise_veto(self, reason: str) -> None:
+        from datetime import timedelta
+        self._veto_until = datetime.utcnow() + timedelta(seconds=self.veto_cooldown)
+        self.state.news.veto_active = True
+        self.state.news.veto_reason = reason[:120]
+        log.warning(f"VETO RAISED — {reason[:80]}... (cool-down {self.veto_cooldown}s)")
+
+        # Auto-clear after cool-down
+        await asyncio.sleep(self.veto_cooldown)
+        self.state.news.veto_active = False
+        self.state.news.veto_reason = ""
+        log.info("Veto cleared — signals re-enabled.")

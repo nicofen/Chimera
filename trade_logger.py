@@ -1,1 +1,1 @@
-# Currently Empty. Will be updating in the future
+# chimera/config/__init__.py

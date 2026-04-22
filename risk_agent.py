@@ -1,77 +1,316 @@
 """
-chimera/config/settings.py
-Load configuration from environment variables or a .env file.
+chimera/agents/strategy_agent.py
+Strategy Agent — The Brain's signal engine.
 
-ALWAYS start with mode="paper" until you have 3+ months of
-consistent paper-trading P&L. Use mode="live" only when you
-are prepared to manage real capital drawdowns.
+Sector strategies:
+  A. Crypto  — Exchange inflow/outflow + memecoin volume spike filter
+  B. Stocks  — Squeeze Probability Score (Sp)
+  C. Forex   — NLP momentum bias on EMA
+  D. Futures — Value Area mean reversion via Volume Profile + AVWAP
+
+All signals are gated by the News Agent veto before being enqueued.
 """
 
-import os
+import asyncio
+from datetime import datetime
 from typing import Any
 
+import numpy as np
 
-def load_config() -> dict[str, Any]:
+from chimera.utils.state import SharedState, TechnicalSignals, Sentiment
+from chimera.utils.logger import setup_logger
+
+log = setup_logger("strategy_agent")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Technical Analysis helpers (vectorized with numpy for speed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ema(prices: np.ndarray, period: int) -> np.ndarray:
+    k = 2 / (period + 1)
+    out = np.empty_like(prices)
+    out[0] = prices[0]
+    for i in range(1, len(prices)):
+        out[i] = prices[i] * k + out[i - 1] * (1 - k)
+    return out
+
+
+def rsi(prices: np.ndarray, period: int = 14) -> float:
+    deltas = np.diff(prices)
+    gains  = np.maximum(deltas, 0)
+    losses = np.abs(np.minimum(deltas, 0))
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> float:
+    """Average Directional Index."""
+    tr   = np.maximum(high[1:] - low[1:],
+           np.maximum(np.abs(high[1:] - close[:-1]),
+                      np.abs(low[1:]  - close[:-1])))
+    pdm  = np.where((high[1:] - high[:-1]) > (low[:-1] - low[1:]),
+                    np.maximum(high[1:] - high[:-1], 0), 0)
+    ndm  = np.where((low[:-1] - low[1:]) > (high[1:] - high[:-1]),
+                    np.maximum(low[:-1] - low[1:], 0), 0)
+    atr_s  = np.convolve(tr,  np.ones(period), 'valid') / period
+    pdi    = 100 * (np.convolve(pdm, np.ones(period), 'valid') / period) / (atr_s + 1e-9)
+    ndi    = 100 * (np.convolve(ndm, np.ones(period), 'valid') / period) / (atr_s + 1e-9)
+    dx     = 100 * np.abs(pdi - ndi) / (pdi + ndi + 1e-9)
+    return float(np.mean(dx[-period:]))
+
+
+def atr_value(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> float:
+    tr = np.maximum(high[1:] - low[1:],
+         np.maximum(np.abs(high[1:] - close[:-1]),
+                    np.abs(low[1:]  - close[:-1])))
+    return float(np.mean(tr[-period:]))
+
+
+def bollinger_squeeze(prices: np.ndarray, period: int = 20) -> tuple[bool, float]:
+    """Returns (is_squeeze, bb_width)."""
+    if len(prices) < period:
+        return False, 0.0
+    window = prices[-period:]
+    std    = np.std(window)
+    mid    = np.mean(window)
+    width  = (2 * std) / (mid + 1e-9)
+    return width < 0.02, width   # squeeze threshold: < 2% band width
+
+
+def detect_rsi_divergence(prices: np.ndarray, rsi_arr: list[float], lookback: int = 5) -> bool:
+    """Bearish or bullish divergence: price and RSI moving in opposite directions."""
+    if len(prices) < lookback + 1 or len(rsi_arr) < lookback + 1:
+        return False
+    price_up = prices[-1] > prices[-lookback]
+    rsi_up   = rsi_arr[-1] > rsi_arr[-lookback]
+    return price_up != rsi_up   # divergence = they disagree
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Squeeze Probability Score (Stocks, Sector B)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def squeeze_probability_score(
+    short_interest: float,   # SI as decimal (e.g. 0.25 = 25%)
+    rvol: float,             # Relative Volume (e.g. 3.5)
+    sentiment_zscore: float, # Z-score of social mention velocity
+) -> float:
     """
-    Returns the Chimera configuration dict.
-    Secrets are read from environment variables — never hardcode them.
-
-    Required env vars:
-      ALPACA_KEY, ALPACA_SECRET, OPENAI_API_KEY
-
-    Optional:
-      WHALE_ALERT_KEY, CMC_API_KEY, DUNE_API_KEY, FINANCIALJUICE_URL
+    Sp = (SI × 0.4) + (Vvelocity × 0.3) + (Ssentiment × 0.3)
+    All inputs are normalised to 0–1 before weighting.
     """
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    si_norm   = min(short_interest / 0.50, 1.0)   # cap at 50% SI → 1.0
+    rvol_norm = min((rvol - 1.0) / 9.0, 1.0)      # RVOL 1→10 mapped to 0→1
+    sent_norm = min(max(sentiment_zscore / 5.0, 0.0), 1.0)  # Z-score 0→5 → 0→1
 
-    return {
-        # ── Mode ──────────────────────────────────────────────────────────────
-        "mode": os.getenv("CHIMERA_MODE", "paper"),   # "paper" | "live"
+    sp = (si_norm * 0.4) + (rvol_norm * 0.3) + (sent_norm * 0.3)
+    return round(sp, 4)
 
-        # ── API Keys ──────────────────────────────────────────────────────────
-        "alpaca_key":    os.environ["ALPACA_KEY"],
-        "alpaca_secret": os.environ["ALPACA_SECRET"],
-        "openai_api_key": os.environ["OPENAI_API_KEY"],
-        "whale_alert_key":  os.getenv("WHALE_ALERT_KEY", ""),
-        "cmc_api_key":      os.getenv("CMC_API_KEY", ""),
-        "dune_api_key":     os.getenv("DUNE_API_KEY", ""),
-        "financialjuice_url": os.getenv(
-            "FINANCIALJUICE_URL",
-            "https://www.financialjuice.com/feed.ashx?c=market",
-        ),
 
-        # ── Symbols ───────────────────────────────────────────────────────────
-        "stock_symbols":      ["AAPL", "TSLA", "GME", "AMC", "BBBY"],
-        "crypto_symbols":     ["BTC/USD", "ETH/USD", "SOL/USD"],
-        "forex_pairs":        ["EUR/USD", "GBP/USD", "USD/JPY"],
-        "futures_contracts":  ["ES1!"],
+# ══════════════════════════════════════════════════════════════════════════════
+# Strategy Agent
+# ══════════════════════════════════════════════════════════════════════════════
 
-        # ── Risk ──────────────────────────────────────────────────────────────
-        "base_risk_pct":    0.01,   # 1% of equity per trade (paper trading default)
-        "kelly_lookback":   50,     # trades to include in Kelly calculation
-        "avg_win_r":        1.5,    # expected win in R-multiples
-        "avg_loss_r":       1.0,    # expected loss in R-multiples
+class StrategyAgent:
+    """
+    Consumes market data from shared state, runs all four sector strategies,
+    and publishes TechnicalSignals to the signal queue.
 
-        # ── Strategy thresholds ───────────────────────────────────────────────
-        "min_sp_score":            0.60,   # minimum Sp to act on a squeeze
-        "btc_inflow_threshold":    1_000_000,  # USD — risk-off trigger
-        "sol_memecoin_spike_threshold": 50_000_000,  # USD 24h vol
+    Signals are suppressed (not emitted) when the News Agent veto is active.
+    """
 
-        # ── Polling intervals (seconds) ───────────────────────────────────────
-        "news_poll_seconds":    30,
-        "strategy_interval_seconds": 15,
-        "whale_poll_seconds":   60,
-        "finviz_poll_seconds":  300,
-        "dune_poll_seconds":    300,
-        "futures_poll_seconds": 60,
+    def __init__(self, state: SharedState, config: dict[str, Any]):
+        self.state  = state
+        self.config = config
+        self.interval = config.get("strategy_interval_seconds", 15)
 
-        # ── News / veto ───────────────────────────────────────────────────────
-        "veto_cooldown_seconds": 600,   # 10 minutes of silence after macro event
+    async def run(self) -> None:
+        log.info("StrategyAgent started.")
+        while True:
+            try:
+                await self._evaluate_all_sectors()
+            except Exception as e:
+                log.warning(f"StrategyAgent error: {e}")
+            await asyncio.sleep(self.interval)
 
-        # ── Dune query IDs ────────────────────────────────────────────────────
-        "dune_memecoin_query_id": "3152691",
-    }
+    async def _evaluate_all_sectors(self) -> None:
+        await asyncio.gather(
+            self._sector_crypto(),
+            self._sector_stocks(),
+            self._sector_forex(),
+            self._sector_futures(),
+        )
+
+    # ── Sector A: Crypto ──────────────────────────────────────────────────────
+
+    async def _sector_crypto(self) -> None:
+        d = self.state.market.crypto
+        if not d:
+            return
+
+        for symbol, bars in d.items():
+            closes = np.array(bars["close"], dtype=float)
+            highs  = np.array(bars["high"],  dtype=float)
+            lows   = np.array(bars["low"],   dtype=float)
+            if len(closes) < 200:
+                continue
+
+            # Exchange inflow/outflow edge
+            exchange_inflow = d.get("btc_exchange_inflow", 0)
+            sol_memecoin_vol_spike = d.get("sol_memecoin_vol_spike", False)
+
+            regime = "risk_off" if exchange_inflow > self.config.get("btc_inflow_threshold", 1000) else "neutral"
+            if sol_memecoin_vol_spike and regime == "risk_off":
+                regime = "high_volatility_scalp"
+
+            signal = self._build_signal("crypto", symbol, closes, highs, lows)
+            signal.sp_score = 0.0  # not applicable for crypto
+
+            # Directional override based on on-chain regime
+            if regime == "risk_off":
+                signal.direction = "flat"
+            elif regime == "high_volatility_scalp":
+                signal.direction = "long"  # momentum scalp on low-cap
+
+            await self._emit(signal)
+
+    # ── Sector B: Stocks (Short Squeeze) ─────────────────────────────────────
+
+    async def _sector_stocks(self) -> None:
+        d = self.state.market.stocks
+        if not d:
+            return
+
+        for symbol, bars in d.items():
+            closes = np.array(bars["close"], dtype=float)
+            highs  = np.array(bars["high"],  dtype=float)
+            lows   = np.array(bars["low"],   dtype=float)
+            if len(closes) < 200:
+                continue
+
+            si   = bars.get("short_interest", 0.0)   # e.g. 0.25
+            rvol = bars.get("rvol", 1.0)
+            zscore = bars.get("social_zscore", 0.0)
+
+            sp = squeeze_probability_score(si, rvol, zscore)
+
+            # Only act on high-conviction squeezes
+            if sp < self.config.get("min_sp_score", 0.60):
+                continue
+
+            signal = self._build_signal("stocks", symbol, closes, highs, lows)
+            signal.sp_score = sp
+            signal.direction = "long" if sp > 0.75 else signal.direction
+
+            await self._emit(signal)
+
+    # ── Sector C: Forex (NLP momentum) ───────────────────────────────────────
+
+    async def _sector_forex(self) -> None:
+        d = self.state.market.forex
+        if not d:
+            return
+
+        for pair, bars in d.items():
+            closes = np.array(bars["close"], dtype=float)
+            highs  = np.array(bars["high"],  dtype=float)
+            lows   = np.array(bars["low"],   dtype=float)
+            if len(closes) < 20:
+                continue
+
+            ema20 = ema(closes, 20)
+            below_ema = closes[-1] < ema20[-1]
+
+            signal = self._build_signal("forex", pair, closes, highs, lows)
+
+            # Hawkish USD + price below 20 EMA → momentum long USD
+            if self.state.news.sentiment == Sentiment.BULLISH and below_ema:
+                signal.direction = "long"
+                signal.confidence *= self.state.news_multiplier()
+
+            await self._emit(signal)
+
+    # ── Sector D: Futures (Value Area mean reversion) ────────────────────────
+
+    async def _sector_futures(self) -> None:
+        d = self.state.market.futures
+        if not d:
+            return
+
+        for contract, bars in d.items():
+            closes  = np.array(bars["close"],  dtype=float)
+            highs   = np.array(bars["high"],   dtype=float)
+            lows    = np.array(bars["low"],    dtype=float)
+            volumes = np.array(bars["volume"], dtype=float)
+            if len(closes) < 50:
+                continue
+
+            # Anchored VWAP approximation (session open)
+            cum_vol_price = np.cumsum(closes * volumes)
+            cum_vol       = np.cumsum(volumes)
+            avwap         = cum_vol_price / (cum_vol + 1e-9)
+
+            val_hi = bars.get("value_area_high", avwap[-1] * 1.002)
+            val_lo = bars.get("value_area_low",  avwap[-1] * 0.998)
+            price  = closes[-1]
+
+            signal = self._build_signal("futures", contract, closes, highs, lows)
+
+            if price <= val_lo:
+                signal.direction  = "long"   # mean-revert from value low
+                signal.confidence = 0.75
+            elif price >= val_hi:
+                signal.direction  = "short"  # mean-revert from value high
+                signal.confidence = 0.75
+
+            await self._emit(signal)
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    def _build_signal(
+        self,
+        sector: str,
+        symbol: str,
+        closes: np.ndarray,
+        highs:  np.ndarray,
+        lows:   np.ndarray,
+    ) -> TechnicalSignals:
+        adx_val  = adx(highs, lows, closes)
+        atr_val  = atr_value(highs, lows, closes)
+        rsi_val  = rsi(closes)
+        squeeze, _ = bollinger_squeeze(closes)
+
+        ema9   = ema(closes, 9)
+        ema20  = ema(closes, 20)
+        ema200 = ema(closes, 200)
+        ribbon = (closes[-1] > ema9[-1] > ema20[-1] > ema200[-1])  # bullish ribbon
+
+        direction = "long" if ribbon and adx_val > 25 else "flat"
+
+        return TechnicalSignals(
+            sector            = sector,
+            symbol            = symbol,
+            direction         = direction,
+            confidence        = min(adx_val / 50.0, 1.0),
+            adx               = adx_val,
+            rsi_divergence    = rsi_val < 30 or rsi_val > 70,
+            bb_squeeze        = squeeze,
+            ema_ribbon_aligned= ribbon,
+            atr               = atr_val,
+            timestamp         = datetime.utcnow(),
+        )
+
+    async def _emit(self, signal: TechnicalSignals) -> None:
+        if self.state.is_vetoed():
+            log.debug(f"Signal for {signal.symbol} suppressed — veto active.")
+            return
+        if signal.direction == "flat":
+            return
+        log.info(f"Signal → {signal.sector}/{signal.symbol} {signal.direction} "
+                 f"ADX={signal.adx:.1f} Sp={signal.sp_score:.2f}")
+        await self.state.put_signal(signal)
