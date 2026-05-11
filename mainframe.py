@@ -6,6 +6,73 @@ WebSocket streams: Alpaca (stocks, forex, futures), crypto exchange WS.
 REST polling:      Whale Alert, CoinMarketCap, Dune Analytics, Finviz, Stocktwits.
 
 Writes normalized OHLCV + metadata bars into state.market.{sector}.
+
+
+
+
+The Institutional Equations Addition
+
+
+
+import numpy as np
+import logging
+from typing import Dict
+
+class RiskManager:
+    def __init__(self, global_state: Dict, fractional_kelly: float = 0.25):
+        self.state = global_state
+        self.fractional_kelly = fractional_kelly
+        self.logger = logging.getLogger("RiskManager")
+
+    def calculate_position_size(self, symbol: str, price: float, atr: float):
+        
+        Implements Fractional Kelly and Volatility-Adjusted Sizing.
+        
+        # 1. Get Strategy Performance Metrics
+        win_rate = self.state['metrics'].get('win_rate', 0.55)
+        win_loss_ratio = self.state['metrics'].get('wl_ratio', 1.5)
+        
+        # 2. Calculate Kelly Fraction (f*)
+        # Formula: f* = (p * (b + 1) - 1) / b
+        kelly_f = (win_rate * (win_loss_ratio + 1) - 1) / win_loss_ratio
+        
+        # Apply Institutional Conservatism (Fractional Kelly)
+        safe_kelly = max(0, kelly_f * self.fractional_kelly)
+        
+        # 3. Apply Heat Map (Global Sector Limit)
+        # We don't want to be 100% in Crypto Memecoins
+        sector = self.get_sector(symbol)
+        sector_limit = self.state['limits'].get(sector, 0.20) # e.g., 20% max for Crypto
+        
+        final_allocation = min(safe_kelly, sector_limit)
+        
+        # 4. Cash Calculation
+        available_equity = self.state['balance']['equity']
+        position_value = available_equity * final_allocation
+        
+        qty = position_value / price
+        return round(qty, 4)
+
+    def calculate_expected_shortfall(self, returns_history: list, alpha: float = 0.05):
+   
+        CVaR calculation: The average loss in the worst alpha% of cases.
+        Used to trigger a Global Circuit Breaker.
+        
+        sorted_returns = np.sort(returns_history)
+        index = int(alpha * len(sorted_returns))
+        es = np.mean(sorted_returns[:index])
+        
+        if abs(es) > self.state['thresholds']['max_es']:
+            self.state['veto_active'] = True
+            self.logger.critical(f"Tail Risk Alert: Expected Shortfall ({es}) exceeds limits!")
+        
+        return es
+
+    def get_sector(self, symbol: str) -> str:
+        # Internal mapping logic for Crypto/Forex/Stocks/Futures
+        if "/" in symbol: return "CRYPTO"
+        if "!" in symbol: return "FUTURES"
+        return "STOCKS"
 """
 
 import asyncio
